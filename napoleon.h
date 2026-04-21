@@ -1,0 +1,703 @@
+#pragma once
+
+#include <errno.h>
+#include <fcntl.h>
+#include <signal.h>
+#include <stdarg.h>
+#include <stdbool.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <time.h>
+#include <unistd.h>
+
+/* Default configuration */
+#define NAPOLEON_MAX_TESTS 4096
+#define NAPOLEON_DEFAULT_TIMEOUT 10
+#define NAPOLEON_FAILURE_BUF_SIZE 4096
+
+/* Run options */
+typedef struct nap_run_options {
+  int default_timeout;
+  bool quiet;
+  const char *suite;
+} nap_run_options;
+
+/* Color codes */
+#define NAP_COLOR_RESET "\x1b[0m"
+#define NAP_COLOR_RED "\x1b[31m"
+#define NAP_COLOR_GREEN "\x1b[32m"
+#define NAP_COLOR_YELLOW "\x1b[33m"
+#define NAP_COLOR_BLUE "\x1b[34m"
+#define NAP_COLOR_CYAN "\x1b[36m"
+#define NAP_COLOR_BOLD "\x1b[1m"
+
+/* Result codes */
+typedef enum {
+  NAP_RESULT_PASS = 0,
+  NAP_RESULT_FAIL,
+  NAP_RESULT_FAIL_ASSERT,
+  NAP_RESULT_FAIL_STRING,
+  NAP_RESULT_FAIL_NUMBER,
+  NAP_RESULT_FAIL_MEMORY,
+  NAP_RESULT_FAIL_TIMEOUT,
+  NAP_RESULT_ERROR,
+  NAP_RESULT_SKIP
+} nap_result;
+
+/* Test parameters */
+typedef struct nap_test_params {
+  const char *suite;       /* Default: NULL (uses filename as suite) */
+  const char *skip_reason; /* Default: NULL (not skipped) */
+  bool capture_output;     /* Default: true */
+  int timeout;             /* Default: 0 (use NAPOLEON_DEFAULT_TIMEOUT) */
+} nap_test_params;
+
+typedef struct nap_test_num_params {
+  double tolerance; /* Default: 0.0 */
+} nap_test_num_params;
+
+/* Test struct */
+typedef struct nap_test {
+  void (*fn)(void);
+  const char *suite;
+  const char *skip_reason;
+  const char *func_name;
+  bool capture_output;
+  int timeout;
+} nap_test;
+
+/* Result struct */
+typedef struct nap_test_result {
+  nap_result result;
+  int exit_code;
+  int signal;
+  long long duration_ms;
+  char captured_output[1024];
+  char failure_expr[256];
+  char failure_expected[256];
+  char failure_got[256];
+  char failure_file[256];
+  int failure_line;
+  int timeout;
+} nap_test_result;
+
+/* State */
+typedef struct nap_state {
+  nap_test tests[NAPOLEON_MAX_TESTS];
+  int test_count;
+  int passed;
+  int failed;
+  int skipped;
+  int errors;
+  bool color_enabled;
+  long long total_duration_ms;
+} nap_state;
+
+/* Public API */
+void _nap_add(void (*test)(void), const char *func_name,
+              nap_test_params params);
+/* Run macro with designated initializer support */
+#define nap_run(...) _nap_run((nap_run_options){__VA_ARGS__})
+
+int _nap_run(nap_run_options options);
+
+/* Assertion macros */
+#define nap_assert(condition)                                                  \
+  _nap_assert((condition), #condition, __FILE__, __LINE__)
+
+#define nap_assert_str(s1, s2) _nap_assert_str((s1), (s2), __FILE__, __LINE__)
+
+#define nap_assert_num(n1, n2, ...)                                            \
+  do {                                                                         \
+    static const nap_test_num_params _nap_tp = {__VA_ARGS__};                  \
+    _nap_assert_num((n1), (n2), _nap_tp, __FILE__, __LINE__);                  \
+  } while (0)
+
+#define nap_assert_mem(p1, p2, size)                                           \
+  _nap_assert_mem((p1), (p2), (size), __FILE__, __LINE__)
+
+/* Helper to stringify macro argument */
+#define _nap_str(x) #x
+#define _nap_str_cat(x) _nap_str(x)
+
+/* Registration macro with designated initializer support */
+#define nap_add(test_fn, ...)                                                  \
+  do {                                                                         \
+    static const nap_test_params _nap_tp = {__VA_ARGS__};                      \
+    _nap_add((test_fn), _nap_str_cat(test_fn), _nap_tp);                       \
+  } while (0)
+
+/* Assertion function declarations */
+void _nap_assert(bool condition, const char *expr, const char *file, int line);
+void _nap_assert_str(const char *s1, const char *s2, const char *file,
+                     int line);
+void _nap_assert_num(double n1, double n2, nap_test_num_params params,
+                     const char *file, int line);
+void _nap_assert_mem(const void *p1, const void *p2, size_t size,
+                     const char *file, int line);
+
+#ifdef NAPOLEON_IMPLEMENTATION
+
+#undef NAPOLEON_IMPLEMENTATION
+
+/* IMPLEMENTATION */
+
+static nap_test _nap_tests[NAPOLEON_MAX_TESTS];
+static int _nap_test_count = 0;
+
+static int _nap_failure_pipe[2] = {-1, -1};
+
+#define NAP_FILE_BASENAME(file)                                                \
+  (strrchr((file), '/') ? strrchr((file), '/') + 1 : (file))
+
+static void nap_print_summary(int passed, int failed, int skipped, int errors,
+                              long long total_duration_ms, bool has_color) {
+  if (has_color)
+    fputs(NAP_COLOR_BOLD, stdout);
+  fputs("\n[summary]\n", stdout);
+  if (has_color)
+    fputs(NAP_COLOR_RESET, stdout);
+
+  if (has_color) {
+    if (failed > 0)
+      fputs(NAP_COLOR_RED, stdout);
+  }
+  fprintf(stdout, "  failed:  %d\n", failed);
+  if (has_color && failed > 0)
+    fputs(NAP_COLOR_RESET, stdout);
+
+  if (has_color) {
+    if (passed > 0)
+      fputs(NAP_COLOR_GREEN, stdout);
+  }
+  fprintf(stdout, "  passed:  %d\n", passed);
+  if (has_color && passed > 0)
+    fputs(NAP_COLOR_RESET, stdout);
+
+  if (errors > 0) {
+    if (has_color)
+      fputs(NAP_COLOR_RED, stdout);
+  }
+  fprintf(stdout, "  errors:  %d\n", errors);
+  if (has_color && errors > 0)
+    fputs(NAP_COLOR_RESET, stdout);
+
+  if (skipped > 0) {
+    if (has_color)
+      fputs(NAP_COLOR_YELLOW, stdout);
+  }
+  fprintf(stdout, "  skipped: %d\n", skipped);
+  if (has_color && skipped > 0)
+    fputs(NAP_COLOR_RESET, stdout);
+
+  fprintf(stdout, "  total:   %d\n", passed + failed + skipped + errors);
+  fprintf(stdout, "  duration: %lld.%03dms\n",
+          (long long)(total_duration_ms / 1000),
+          (int)(total_duration_ms % 1000));
+  if (has_color)
+    fputs(NAP_COLOR_RESET, stdout);
+}
+
+static long long nap_now_ms(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (long long)ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+}
+
+static void nap_write_failure_to_pipe(nap_result type, const char *expr,
+                                      const char *expected, const char *got,
+                                      const char *file, int line) {
+  if (_nap_failure_pipe[1] < 0) {
+    _exit(1);
+    return;
+  }
+
+  char buf[NAPOLEON_FAILURE_BUF_SIZE];
+  int offset;
+  switch (type) {
+  case NAP_RESULT_FAIL_ASSERT:
+    offset = snprintf(buf, sizeof(buf), "%d|%s|%s|%d|", (int)type,
+                      expr ? expr : "", file, line);
+    break;
+  case NAP_RESULT_FAIL_STRING:
+  case NAP_RESULT_FAIL_NUMBER:
+    offset = snprintf(buf, sizeof(buf), "%d|%s|%s|%s|%s|%d|", (int)type, file,
+                      expr ? expr : "-", expected ? expected : "",
+                      got ? got : "", line);
+    break;
+  case NAP_RESULT_FAIL_MEMORY:
+    offset = snprintf(buf, sizeof(buf), "%d|memory compare failed|%s|%d|",
+                      (int)type, file, line);
+    break;
+  case NAP_RESULT_FAIL_TIMEOUT:
+    offset = snprintf(buf, sizeof(buf), "%d|timeout exceeded|%s|%d|", (int)type,
+                      file, line);
+    break;
+  default:
+    return;
+  }
+
+  ssize_t written = write(_nap_failure_pipe[1], buf, offset);
+  (void)written;
+  _exit(1);
+}
+
+void _nap_assert(bool condition, const char *expr, const char *file, int line) {
+  if (condition)
+    return;
+  nap_write_failure_to_pipe(NAP_RESULT_FAIL_ASSERT, expr, NULL, NULL, file,
+                            line);
+  _exit(1);
+}
+
+void _nap_assert_str(const char *s1, const char *s2, const char *file,
+                     int line) {
+  if (s1 == s2)
+    return;
+  if (s1 && s2 && strcmp(s1, s2) == 0)
+    return;
+
+  nap_write_failure_to_pipe(NAP_RESULT_FAIL_STRING, NULL, s1 ? s1 : "(null)",
+                            s2 ? s2 : "(null)", file, line);
+  _exit(1);
+}
+
+void _nap_assert_num(double n1, double n2, nap_test_num_params params,
+                     const char *file, int line) {
+  double tolerance = params.tolerance;
+  double diff = n1 - n2;
+  if (diff < 0)
+    diff = -diff;
+
+  if (diff <= tolerance)
+    return;
+
+  char buf1[64], buf2[64];
+  snprintf(buf1, sizeof(buf1), "%.6g", n1);
+  snprintf(buf2, sizeof(buf2), "%.6g", n2);
+
+  char tol_buf[64];
+  snprintf(tol_buf, sizeof(tol_buf), "%.6g", tolerance);
+
+  char expr[256];
+  snprintf(expr, sizeof(expr), "%s ~= %s (tolerance: %s)", buf1, buf2, tol_buf);
+
+  nap_write_failure_to_pipe(NAP_RESULT_FAIL_NUMBER, expr, buf2, buf1, file,
+                            line);
+  _exit(1);
+}
+
+void _nap_assert_mem(const void *p1, const void *p2, size_t size,
+                     const char *file, int line) {
+  if (p1 == p2)
+    return;
+  if (memcmp(p1, p2, size) == 0)
+    return;
+
+  nap_write_failure_to_pipe(NAP_RESULT_FAIL_MEMORY, NULL, NULL, NULL, file,
+                            line);
+  _exit(1);
+}
+
+static bool nap_read_failure_from_pipe(nap_test_result *result) {
+  if (_nap_failure_pipe[0] < 0)
+    return false;
+
+  fd_set fds;
+  struct timeval tv;
+  tv.tv_sec = 0;
+  tv.tv_usec = 1000;
+
+  FD_ZERO(&fds);
+  FD_SET(_nap_failure_pipe[0], &fds);
+
+  int ret = select(_nap_failure_pipe[0] + 1, &fds, NULL, NULL, &tv);
+  if (ret <= 0)
+    return false;
+
+  char buf[NAPOLEON_FAILURE_BUF_SIZE];
+  ssize_t n = read(_nap_failure_pipe[0], buf, sizeof(buf) - 1);
+  if (n <= 0)
+    return false;
+  buf[n] = '\0';
+
+  char *saveptr;
+  char *type_str = strtok_r(buf, "|", &saveptr);
+  char *file_str = strtok_r(NULL, "|", &saveptr);
+  char *expr = strtok_r(NULL, "|", &saveptr);
+  char *expected = strtok_r(NULL, "|", &saveptr);
+  char *got = strtok_r(NULL, "|", &saveptr);
+  char *line_str = strtok_r(NULL, "|", &saveptr);
+
+  if (!type_str || !file_str)
+    return false;
+
+  result->result = (nap_result)atoi(type_str);
+  snprintf(result->failure_file, sizeof(result->failure_file), "%s",
+           file_str ? file_str : "");
+  if (line_str) {
+    result->failure_line = atoi(line_str);
+  }
+
+  switch (result->result) {
+  case NAP_RESULT_FAIL_ASSERT:
+    snprintf(result->failure_expr, sizeof(result->failure_expr), "%s",
+             expr ? expr : "");
+    break;
+  case NAP_RESULT_FAIL_STRING:
+  case NAP_RESULT_FAIL_NUMBER:
+    snprintf(result->failure_expr, sizeof(result->failure_expr), "%s",
+             expr ? expr : "");
+    snprintf(result->failure_expected, sizeof(result->failure_expected), "%s",
+             expected ? expected : "");
+    snprintf(result->failure_got, sizeof(result->failure_got), "%s",
+             got ? got : "");
+    break;
+  case NAP_RESULT_FAIL_MEMORY:
+    snprintf(result->failure_expr, sizeof(result->failure_expr),
+             "memory compare failed");
+    break;
+  case NAP_RESULT_FAIL_TIMEOUT:
+    snprintf(result->failure_expr, sizeof(result->failure_expr), "timeout");
+    break;
+  default:
+    return true;
+  }
+
+  return true;
+}
+
+static void nap_capture_output(int pipe_fd, char *buf, size_t buf_size) {
+  if (pipe_fd < 0)
+    return;
+
+  struct timeval tv;
+  tv.tv_sec = NAPOLEON_DEFAULT_TIMEOUT;
+  tv.tv_usec = 0;
+
+  setsockopt(pipe_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+  ssize_t n = read(pipe_fd, buf, buf_size - 1);
+  if (n > 0) {
+    buf[n] = '\0';
+  } else {
+    buf[0] = '\0';
+  }
+
+  close(pipe_fd);
+}
+
+static void nap_run_in_child(nap_test *test, int pipe_stdout[2],
+                             int pipe_stderr[2], bool capture_output) {
+  if (capture_output) {
+    dup2(pipe_stdout[1], STDOUT_FILENO);
+    dup2(pipe_stderr[1], STDERR_FILENO);
+    close(pipe_stdout[0]);
+    close(pipe_stderr[0]);
+    close(pipe_stdout[1]);
+    close(pipe_stderr[1]);
+  } else {
+    close(pipe_stdout[1]);
+    close(pipe_stderr[1]);
+    close(pipe_stdout[0]);
+    close(pipe_stderr[0]);
+  }
+
+  close(_nap_failure_pipe[0]);
+
+  test->fn();
+
+  _exit(0);
+}
+
+static nap_test_result nap_run_test(nap_test *test, int default_timeout) {
+  nap_test_result result = {0};
+  result.result = NAP_RESULT_PASS;
+
+  bool capture_output = test->capture_output;
+  int timeout = test->timeout > 0 ? test->timeout : default_timeout;
+
+  int pipe_stdout[2] = {-1, -1};
+  int pipe_stderr[2] = {-1, -1};
+
+  if (capture_output) {
+    if (pipe(pipe_stdout) != 0 || pipe(pipe_stderr) != 0) {
+      result.result = NAP_RESULT_ERROR;
+      snprintf(result.failure_expr, sizeof(result.failure_expr),
+               "Failed to create pipe");
+      return result;
+    }
+  }
+
+  if (pipe(_nap_failure_pipe) != 0) {
+    result.result = NAP_RESULT_ERROR;
+    snprintf(result.failure_expr, sizeof(result.failure_expr),
+             "Failed to create failure pipe");
+    return result;
+  }
+
+  long long start_ms = nap_now_ms();
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    result.result = NAP_RESULT_ERROR;
+    snprintf(result.failure_expr, sizeof(result.failure_expr),
+             "Failed to fork: %s", strerror(errno));
+    return result;
+  }
+
+  if (pid == 0) {
+    nap_run_in_child(test, pipe_stdout, pipe_stderr, capture_output);
+  }
+
+  if (pipe_stdout[1] >= 0)
+    close(pipe_stdout[1]);
+  if (pipe_stderr[1] >= 0)
+    close(pipe_stderr[1]);
+
+  int status = 0;
+  int wait_count = 0;
+  while (1) {
+    pid_t ret = waitpid(pid, &status, WNOHANG);
+    if (ret != 0)
+      break;
+    wait_count++;
+    if (wait_count >= timeout * 100) {
+      kill(pid, SIGKILL);
+      waitpid(pid, &status, 0);
+      status = 0;
+      break;
+    }
+    usleep(10000);
+  }
+
+  int timeout_val =
+      test->timeout > 0 ? test->timeout : NAPOLEON_DEFAULT_TIMEOUT;
+  result.timeout = timeout_val;
+
+  if (wait_count >= timeout_val * 100) {
+    result.result = NAP_RESULT_FAIL_TIMEOUT;
+  }
+
+  long long end_ms = nap_now_ms();
+  result.duration_ms = end_ms - start_ms;
+
+  nap_read_failure_from_pipe(&result);
+
+  if (WIFEXITED(status)) {
+    result.exit_code = WEXITSTATUS(status);
+  } else if (WIFSIGNALED(status)) {
+    int sig = WTERMSIG(status);
+    result.signal = sig;
+    result.result = NAP_RESULT_FAIL;
+    snprintf(result.failure_expr, sizeof(result.failure_expr),
+             "Test killed by signal %d", sig);
+  }
+
+  if (result.result == NAP_RESULT_PASS && WIFEXITED(status) &&
+      result.exit_code != 0) {
+    result.result = NAP_RESULT_FAIL;
+  }
+
+  close(_nap_failure_pipe[0]);
+  _nap_failure_pipe[0] = -1;
+  _nap_failure_pipe[1] = -1;
+
+  if (capture_output) {
+    nap_capture_output(pipe_stdout[0], result.captured_output,
+                       sizeof(result.captured_output));
+    close(pipe_stderr[0]);
+  }
+
+  return result;
+}
+
+static void nap_print_result_detail(nap_test_result *result) {
+  if (result->result > NAP_RESULT_FAIL_TIMEOUT)
+    return;
+
+  if (result->failure_file[0]) {
+    fprintf(stdout, "    %s:%d\n", result->failure_file, result->failure_line);
+  }
+
+  switch (result->result) {
+  case NAP_RESULT_FAIL:
+  case NAP_RESULT_FAIL_ASSERT:
+    if (result->failure_expr[0]) {
+      fprintf(stdout, "    %s\n", result->failure_expr);
+    }
+    break;
+  case NAP_RESULT_FAIL_STRING:
+    if (result->failure_expected[0] || result->failure_got[0]) {
+      fprintf(stdout, "    got:      \"%s\"\n", result->failure_got);
+      fprintf(stdout, "    expected: \"%s\"\n", result->failure_expected);
+    }
+    break;
+  case NAP_RESULT_FAIL_NUMBER:
+    if (result->failure_expected[0] || result->failure_got[0]) {
+      fprintf(stdout, "    %s\n", result->failure_expr);
+      fprintf(stdout, "    got:      %s\n", result->failure_got);
+      fprintf(stdout, "    expected: %s\n", result->failure_expected);
+    }
+    break;
+  case NAP_RESULT_FAIL_MEMORY:
+    fputs("    memory regions differ\n", stdout);
+    break;
+  case NAP_RESULT_FAIL_TIMEOUT:
+    fprintf(stdout, "    test exceeded timeout (%d s)\n", result->timeout);
+    break;
+  default:
+    return;
+  }
+
+  if (result->captured_output[0]) {
+    fputs("    output:\n", stdout);
+    const char *start = result->captured_output;
+    while (*start) {
+      const char *newline = strchr(start, '\n');
+      if (!newline) {
+        fprintf(stdout, "      %s\n", start);
+        break;
+      }
+      fprintf(stdout, "      %.*s\n", (int)(newline - start), start);
+      start = newline + 1;
+    }
+  }
+}
+
+void _nap_add(void (*test)(void), const char *func_name,
+              nap_test_params params) {
+  if (_nap_test_count >= NAPOLEON_MAX_TESTS - 1) {
+    fprintf(stderr, "Napoleon: maximum number of tests reached (%d)\n",
+            NAPOLEON_MAX_TESTS);
+    return;
+  }
+
+  nap_test *t = &_nap_tests[_nap_test_count];
+
+  t->fn = test;
+  t->suite = params.suite;
+  t->skip_reason = params.skip_reason;
+  t->func_name = func_name;
+  t->capture_output = params.capture_output;
+  t->timeout = params.timeout;
+
+  _nap_test_count++;
+}
+
+int _nap_run(nap_run_options options) {
+  int passed = 0;
+  int failed = 0;
+  int skipped = 0;
+  int errors = 0;
+  int default_timeout = options.default_timeout > 0 ? options.default_timeout
+                                                    : NAPOLEON_DEFAULT_TIMEOUT;
+  bool has_color = isatty(STDOUT_FILENO) != 0;
+  long long total_start = nap_now_ms();
+
+  fputs("\n[tests]\n", stdout);
+
+  const char *filter_suite = options.suite;
+
+  for (int i = 0; i < _nap_test_count; i++) {
+    nap_test *t = &_nap_tests[i];
+
+    if (!t->suite) {
+      char suite_copy[256];
+      snprintf(suite_copy, sizeof(suite_copy), "%s",
+               NAP_FILE_BASENAME(__FILE__));
+      char *ext = strrchr(suite_copy, '.');
+      if (ext)
+        *ext = '\0';
+      t->suite = strdup(suite_copy);
+    }
+
+    if (!t->func_name) {
+      t->func_name = "unknown";
+    }
+  }
+
+  const char *current_suite = NULL;
+
+  for (int i = 0; i < _nap_test_count; i++) {
+    nap_test *t = &_nap_tests[i];
+
+    if (filter_suite && strcmp(t->suite, filter_suite) != 0) {
+      continue;
+    }
+
+    if (!current_suite || strcmp(t->suite, current_suite) != 0) {
+      current_suite = t->suite;
+      if (has_color) {
+        fprintf(stdout, "\n" NAP_COLOR_BOLD "[%s]" NAP_COLOR_RESET "\n",
+                current_suite);
+      } else {
+        fprintf(stdout, "\n[%s]\n", current_suite);
+      }
+    }
+
+    if (t->skip_reason) {
+      skipped++;
+      if (has_color) {
+        fputs("  " NAP_COLOR_YELLOW "SKIP" NAP_COLOR_RESET, stdout);
+      } else {
+        fputs("  SKIP", stdout);
+      }
+      fprintf(stdout, " %s %s\n", t->func_name, t->skip_reason);
+      continue;
+    }
+
+    nap_test_result result = nap_run_test(t, default_timeout);
+
+    if (result.result == NAP_RESULT_PASS) {
+      passed++;
+      if (!options.quiet) {
+        if (has_color) {
+          fputs("  " NAP_COLOR_GREEN "PASS" NAP_COLOR_RESET, stdout);
+        } else {
+          fputs("  PASS", stdout);
+        }
+        fprintf(stdout, " %s\n", t->func_name);
+      }
+    } else if (result.result > NAP_RESULT_PASS) {
+      failed++;
+      if (has_color) {
+        fputs("  " NAP_COLOR_RED "FAIL" NAP_COLOR_RESET, stdout);
+      } else {
+        fputs("  FAIL", stdout);
+      }
+      fprintf(stdout, " %s (%.3fs)\n", t->func_name,
+              result.duration_ms / 1000.0);
+      nap_print_result_detail(&result);
+    } else if (result.result == NAP_RESULT_ERROR) {
+      errors++;
+      if (has_color) {
+        fputs("  " NAP_COLOR_RED "ERROR" NAP_COLOR_RESET, stdout);
+      } else {
+        fputs("  ERROR", stdout);
+      }
+      fprintf(stdout, " %s", t->func_name);
+      if (result.failure_expr[0]) {
+        fprintf(stdout, ": %s", result.failure_expr);
+      }
+      fprintf(stdout, "\n");
+    }
+  }
+
+  long long total_duration = nap_now_ms() - total_start;
+
+  nap_print_summary(passed, failed, skipped, errors, total_duration, has_color);
+
+  if (failed > 0)
+    return 1;
+  if (errors > 0)
+    return 2;
+  return 0;
+}
+
+#endif /* NAPOLEON_IMPLEMENTATION */
