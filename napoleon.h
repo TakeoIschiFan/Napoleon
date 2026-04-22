@@ -20,7 +20,6 @@
 typedef struct nap_add_optionals {
     const char* suite;
     const char* skip_reason;
-    bool capture_output;
     int timeout;
 } nap_add_optionals;
 #define nap_add(test_fn, ...)                                                                                          \
@@ -34,6 +33,7 @@ void _nap_add(void (*test)(void), const char* func_name, nap_add_optionals param
 typedef struct nap_run_optionals {
     int default_timeout;
     bool quiet;
+    bool dont_capture_output;
     const char* suite;
 } nap_run_optionals;
 #define nap_run(...) _nap_run((nap_run_optionals){__VA_ARGS__})
@@ -103,7 +103,6 @@ typedef struct nap_test {
     const char* suite;
     const char* skip_reason;
     const char* func_name;
-    bool capture_output;
     int timeout;
 } _nap_test;
 
@@ -113,6 +112,7 @@ typedef struct nap_test_result {
     int signal;
     long long duration_ms;
     char captured_output[1024];
+    char captured_stderr[1024];
     char failure_expr[256];
     char failure_expected[256];
     char failure_got[256];
@@ -124,6 +124,7 @@ typedef struct nap_test_result {
 static _nap_test* _nap_tests = NULL;
 static int _nap_test_count = 0;
 static int _nap_test_capacity = 0;
+static bool _nap_should_capture_output = true;
 
 static int _nap_failure_pipe[2] = {-1, -1};
 
@@ -139,7 +140,7 @@ static void _nap_write_failure_to_pipe(_nap_result type, const char* expr, const
     int offset;
     switch (type) {
         case NAP_RESULT_FAIL_ASSERT:
-            offset = snprintf(buf, sizeof(buf), "%d|%s|%s|%d|", (int)type, expr ? expr : "", file, line);
+            offset = snprintf(buf, sizeof(buf), "%d|%s|%s|%s|%s|%d|", (int)type, file, expr ? expr : "", "-", "", line);
             break;
         case NAP_RESULT_FAIL_STRING:
         case NAP_RESULT_FAIL_NUMBER:
@@ -188,8 +189,8 @@ static bool _nap_read_failure_from_pipe(_nap_test_result* result) {
     char* file_str = strtok_r(NULL, "|", &saveptr);
     char* expr = strtok_r(NULL, "|", &saveptr);
     char* expected = strtok_r(NULL, "|", &saveptr);
-    char* got = strtok_r(NULL, "|", &saveptr);
     char* line_str = strtok_r(NULL, "|", &saveptr);
+    char* got = strtok_r(NULL, "|", &saveptr);
 
     if (!type_str || !file_str)
         return false;
@@ -335,8 +336,22 @@ static void _nap_print_result_detail(_nap_test_result* result) {
     }
 
     if (result->captured_output[0]) {
-        fputs("    output:\n", stdout);
+        fputs("    stdout:\n", stdout);
         const char* start = result->captured_output;
+        while (*start) {
+            const char* newline = strchr(start, '\n');
+            if (!newline) {
+                fprintf(stdout, "      %s\n", start);
+                break;
+            }
+            fprintf(stdout, "      %.*s\n", (int)(newline - start), start);
+            start = newline + 1;
+        }
+    }
+
+    if (result->captured_stderr[0]) {
+        fputs("    stderr:\n", stdout);
+        const char* start = result->captured_stderr;
         while (*start) {
             const char* newline = strchr(start, '\n');
             if (!newline) {
@@ -394,10 +409,10 @@ static void _nap_run_in_child(_nap_test* test, int pipe_stdout[2], int pipe_stde
         close(pipe_stdout[1]);
         close(pipe_stderr[1]);
     } else {
-        close(pipe_stdout[1]);
-        close(pipe_stderr[1]);
         close(pipe_stdout[0]);
+        close(pipe_stdout[1]);
         close(pipe_stderr[0]);
+        close(pipe_stderr[1]);
     }
 
     close(_nap_failure_pipe[0]);
@@ -411,7 +426,7 @@ static _nap_test_result _nap_run_test(_nap_test* test, int global_timeout) {
     _nap_test_result result = {0};
     result.result = NAP_RESULT_PASS;
 
-    bool capture_output = test->capture_output;
+    bool capture_output = _nap_should_capture_output;
     int timeout = test->timeout > 0 ? test->timeout : global_timeout;
 
     int pipe_stdout[2] = {-1, -1};
@@ -496,7 +511,7 @@ static _nap_test_result _nap_run_test(_nap_test* test, int global_timeout) {
 
     if (capture_output) {
         _nap_capture_output(pipe_stdout[0], result.captured_output, sizeof(result.captured_output), timeout);
-        close(pipe_stderr[0]);
+        _nap_capture_output(pipe_stderr[0], result.captured_stderr, sizeof(result.captured_stderr), timeout);
     }
 
     return result;
@@ -521,7 +536,6 @@ void _nap_add(void (*test)(void), const char* func_name, nap_add_optionals param
     t->suite = params.suite;
     t->skip_reason = params.skip_reason;
     t->func_name = func_name;
-    t->capture_output = params.capture_output;
     t->timeout = params.timeout;
 
     _nap_test_count++;
@@ -533,6 +547,7 @@ int _nap_run(nap_run_optionals options) {
     int skipped = 0;
     int errors = 0;
     int default_timeout = options.default_timeout;
+    _nap_should_capture_output = !options.dont_capture_output;
     long long total_start = _nap_now_ms();
 
     fputs("\n[tests]\n", stdout);

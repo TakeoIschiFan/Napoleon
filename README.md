@@ -113,6 +113,23 @@ int main(void){
 }
 ```
 
+#### Output Control
+
+By default, test output is captured and displayed when tests fail. You can suppress passed test messages with `dont_print_passes` or redirect all test output to `/dev/null` with `dont_capture_output`.
+
+```c
+void my_test(void){
+    printf("this goes to captured output\n");
+    nap_assert(true);
+}
+
+int main(void){
+    register_my_tests();
+    nap_run(.dont_print_passes = true, .dont_capture_output = true); // only prints failed tests, test output goes to /dev/null
+    return 0;
+}
+```
+
 ## License
 
 [MIT](LICENSE.md)
