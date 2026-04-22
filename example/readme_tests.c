@@ -6,9 +6,9 @@ void test_basic(void) { nap_assert(true); }
 void test_strings(void) { nap_assert_str("my string should equal", "my string should equal"); }
 
 void test_captured_output(void) {
-    write(STDOUT_FILENO, "captured stdout\n", 16);
-    write(STDERR_FILENO, "captured stderr\n", 16);
-    nap_assert(false);
+    fprintf(stdout, "captured stdout\n");
+    fprintf(stderr, "captured stderr\n");
+    nap_assert(true);
 }
 
 void test_numerics(void) { nap_assert_num(24, 24); }
@@ -30,6 +30,13 @@ void test_timeout(void) {
     nap_assert(true);
 }
 
+void test_expected_failure_passes(void) { nap_assert(false); }
+
+void test_sleep_5_seconds(void) {
+    sleep(5);
+    nap_assert(true);
+}
+
 void register_tests(void) {
     nap_add(test_basic);
     nap_add(test_strings, .suite = "asserts");
@@ -40,4 +47,6 @@ void register_tests(void) {
     nap_add(test_skipped, .skip_reason = "not implemented yet");
     nap_add(test_timeout);
     nap_add(test_captured_output);
+    nap_add(test_expected_failure_passes, .should_fail = true);
+    nap_add(test_sleep_5_seconds, .should_fail = true, .timeout = 1);
 }

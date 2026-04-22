@@ -21,6 +21,7 @@ typedef struct nap_add_optionals {
     const char* suite;
     const char* skip_reason;
     int timeout;
+    bool should_fail;
 } nap_add_optionals;
 #define nap_add(test_fn, ...)                                                                                          \
     do {                                                                                                               \
@@ -123,6 +124,7 @@ typedef struct nap_test {
     const char* skip_reason;
     const char* func_name;
     int timeout;
+    bool should_fail;
 } _nap_test;
 
 typedef struct nap_test_result {
@@ -556,6 +558,7 @@ void _nap_add(void (*test)(void), const char* func_name, const char* file_name, 
     t->skip_reason = params.skip_reason;
     t->func_name = func_name;
     t->timeout = params.timeout;
+    t->should_fail = params.should_fail;
 
     if (!t->suite) {
         t->suite = strdup(_nap_basename_strip_ext(file_name));
@@ -609,16 +612,30 @@ int _nap_run(nap_run_optionals options) {
         _nap_test_result result = _nap_run_test(t, default_timeout);
 
         if (result.result == NAP_RESULT_PASS) {
-            passed++;
-            if (!options.quiet) {
-                fputs("  " NAP_COLOR_GREEN "PASS" NAP_COLOR_RESET, stdout);
-                fprintf(stdout, " %s\n", t->func_name);
+            if (t->should_fail) {
+                failed++;
+                fputs("  " NAP_COLOR_RED "FAIL" NAP_COLOR_RESET, stdout);
+                fprintf(stdout, " %s (expected to fail but passed)\n", t->func_name);
+            } else {
+                passed++;
+                if (!options.quiet) {
+                    fputs("  " NAP_COLOR_GREEN "PASS" NAP_COLOR_RESET, stdout);
+                    fprintf(stdout, " %s\n", t->func_name);
+                }
             }
         } else if (result.result > NAP_RESULT_PASS) {
-            failed++;
-            fputs("  " NAP_COLOR_RED "FAIL" NAP_COLOR_RESET, stdout);
-            fprintf(stdout, " %s (%.3fs)\n", t->func_name, result.duration_ms / 1000.0);
-            _nap_print_result_detail(&result);
+            if (t->should_fail) {
+                passed++;
+                if (!options.quiet) {
+                    fputs("  " NAP_COLOR_GREEN "PASS" NAP_COLOR_RESET, stdout);
+                    fprintf(stdout, " %s (expected to fail)\n", t->func_name);
+                }
+            } else {
+                failed++;
+                fputs("  " NAP_COLOR_RED "FAIL" NAP_COLOR_RESET, stdout);
+                fprintf(stdout, " %s (%.3fs)\n", t->func_name, result.duration_ms / 1000.0);
+                _nap_print_result_detail(&result);
+            }
         } else if (result.result == NAP_RESULT_ERROR) {
             errors++;
             fputs("  " NAP_COLOR_RED "ERROR" NAP_COLOR_RESET, stdout);
