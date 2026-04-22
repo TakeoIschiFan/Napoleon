@@ -25,9 +25,9 @@ typedef struct nap_add_optionals {
 #define nap_add(test_fn, ...)                                                                                          \
     do {                                                                                                               \
         static const nap_add_optionals _nap_tp = {__VA_ARGS__};                                                        \
-        _nap_add((test_fn), _nap_str_cat(test_fn), _nap_tp);                                                           \
+        _nap_add((test_fn), _nap_str_cat(test_fn), _nap_str_cat(__FILE__), _nap_tp);                                       \
     } while (0)
-void _nap_add(void (*test)(void), const char* func_name, nap_add_optionals params);
+void _nap_add(void (*test)(void), const char* func_name, const char* file_name, nap_add_optionals params);
 
 // nap_run()
 typedef struct nap_run_optionals {
@@ -78,6 +78,25 @@ void _nap_assert_mem(const void* p1, const void* p2, size_t size, const char* fi
 
 /* ── Utils ── */
 #define NAP_FILE_BASENAME(file) (strrchr((file), '/') ? strrchr((file), '/') + 1 : (file))
+
+static const char* _nap_basename_strip_ext(const char* file_name) {
+    static char buf[256];
+    const char* base = NAP_FILE_BASENAME(file_name);
+    int len = (int)strlen(base);
+    if (len > 0 && base[len - 1] == '"') {
+        len--;
+    }
+    if (len > 0 && base[0] == '"') {
+        base++;
+        len--;
+    }
+    snprintf(buf, sizeof(buf), "%.*s", len, base);
+    char* ext = strrchr(buf, '.');
+    if (ext) {
+        *ext = '\0';
+    }
+    return buf;
+}
 
 static long long _nap_now_ms(void) {
     struct timespec ts;
@@ -518,7 +537,7 @@ static _nap_test_result _nap_run_test(_nap_test* test, int global_timeout) {
 }
 
 /* ── API functions ── */
-void _nap_add(void (*test)(void), const char* func_name, nap_add_optionals params) {
+void _nap_add(void (*test)(void), const char* func_name, const char* file_name, nap_add_optionals params) {
     if (_nap_test_capacity == 0 || _nap_test_count >= _nap_test_capacity) {
         int new_capacity = _nap_test_capacity == 0 ? 64 : _nap_test_capacity + 64;
         _nap_test* new_tests = (_nap_test*)realloc(_nap_tests, new_capacity * sizeof(_nap_test));
@@ -538,6 +557,10 @@ void _nap_add(void (*test)(void), const char* func_name, nap_add_optionals param
     t->func_name = func_name;
     t->timeout = params.timeout;
 
+    if (!t->suite) {
+        t->suite = strdup(_nap_basename_strip_ext(file_name));
+    }
+
     _nap_test_count++;
 }
 
@@ -556,15 +579,6 @@ int _nap_run(nap_run_optionals options) {
 
     for (int i = 0; i < _nap_test_count; i++) {
         _nap_test* t = &_nap_tests[i];
-
-        if (!t->suite) {
-            char suite_copy[256];
-            snprintf(suite_copy, sizeof(suite_copy), "%s", NAP_FILE_BASENAME(__FILE__));
-            char* ext = strrchr(suite_copy, '.');
-            if (ext)
-                *ext = '\0';
-            t->suite = strdup(suite_copy);
-        }
 
         if (!t->func_name) {
             t->func_name = "unknown";
