@@ -4,7 +4,8 @@
 
 - [ ] C++ Support
 - [ ] Windows support. Current forking and process running only works on POSIX.
-- [ ] Better timeouts, maybe per suite or per test. Non-timeoutable tests.
+- [x] Better timeouts, maybe per suite or per test. Non-timeoutable tests.
+- [ ] Abstract malloc and free for dynamic test array
 
 ## Features nice-to-have
 

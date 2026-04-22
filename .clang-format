@@ -1,0 +1,10 @@
+---
+BasedOnStyle: LLVM
+IndentWidth: 4
+UseTab: Never
+PointerAlignment: Left
+EmptyLineBeforeAccessModifier: Always
+EmptyLineAfterAccessModifier: Always
+InsertNewlineAtEOF: true
+IndentCaseLabels: true
+ColumnLimit: 120

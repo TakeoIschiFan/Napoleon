@@ -1,6 +1,6 @@
 # Napoleon
 
-Napoleon is a minimal single-header-style testing library for C. There are a bunch of these, but this is mine.
+Napoleon is a minimal single-header-style unit testing library for C. There are a bunch of these, but this is mine.
 
 ## Usage
 
@@ -92,7 +92,7 @@ void register_my_tests(){
 
 #### Timeouts
 
-By default, tests time out after ten seconds. You can change this by passing the optional `timeout` argument to `nap_run()`.
+By default, tests don't time out. You can change this by passing the optional `default_timeout` argument to `nap_run()` or specify a per-test `timeout` in `nap_add()`.
 
 ```c
 #include <unistd>
@@ -108,11 +108,11 @@ void register_my_tests(){
 
 int main(void){
     register_my_tests();
-    int result = nap_run(.timeout = 5); // will FAIL!
+    int result = nap_run(.default_timeout = 5); // will FAIL!
     return result;
 }
 ```
 
 ## License
 
-MIT.
+[MIT](LICENSE.md)
