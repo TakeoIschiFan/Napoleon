@@ -24,10 +24,7 @@ typedef struct nap_add_optionals {
     bool should_fail;
 } nap_add_optionals;
 #define nap_add(test_fn, ...)                                                                                          \
-    do {                                                                                                               \
-        static const nap_add_optionals _nap_tp = {__VA_ARGS__};                                                        \
-        _nap_add((test_fn), _nap_str_cat(test_fn), _nap_str_cat(__FILE__), _nap_tp);                                       \
-    } while (0)
+    _nap_add((test_fn), _nap_str_cat(test_fn), _nap_str_cat(__FILE__), (nap_add_optionals){__VA_ARGS__})
 void _nap_add(void (*test)(void), const char* func_name, const char* file_name, nap_add_optionals params);
 
 // nap_run()
@@ -48,14 +45,15 @@ void _nap_assert(bool condition, const char* expr, const char* file, int line);
 void _nap_assert_str(const char* s1, const char* s2, const char* file, int line);
 
 typedef struct nap_assert_num_optionals {
-    double tolerance; /* Default: 0.0 */
+    long double tolerance; /* Default: 0.0 */
 } nap_assert_num_optionals;
 #define nap_assert_num(n1, n2, ...)                                                                                    \
-    do {                                                                                                               \
-        static const nap_assert_num_optionals _nap_tp = {__VA_ARGS__};                                                 \
-        _nap_assert_num((n1), (n2), _nap_tp, __FILE__, __LINE__);                                                      \
-    } while (0)
-void _nap_assert_num(double n1, double n2, nap_assert_num_optionals params, const char* file, int line);
+    _nap_assert_num((n1), (n2), (nap_assert_num_optionals){__VA_ARGS__}, __FILE__, __LINE__)
+/* Comparing numerics as long double.
+   On linux x86-64 and ARM64 long double has a >= 64-bit
+   significand so every int64_t/uint64_t converts exactly.
+   TODO: This is NOT portable to windows/macos  */
+void _nap_assert_num(long double n1, long double n2, nap_assert_num_optionals params, const char* file, int line);
 
 #define nap_assert_mem(p1, p2, size) _nap_assert_mem((p1), (p2), (size), __FILE__, __LINE__)
 void _nap_assert_mem(const void* p1, const void* p2, size_t size, const char* file, int line);
@@ -284,9 +282,13 @@ void _nap_assert_str(const char* s1, const char* s2, const char* file, int line)
     _exit(1);
 }
 
-void _nap_assert_num(double n1, double n2, nap_assert_num_optionals params, const char* file, int line) {
-    double tolerance = params.tolerance;
-    double diff = n1 - n2;
+void _nap_assert_num(long double n1, long double n2, nap_assert_num_optionals params, const char* file, int line) {
+    long double tolerance = params.tolerance;
+
+    if (n1 == n2)
+        return;
+
+    long double diff = n1 - n2;
     if (diff < 0)
         diff = -diff;
 
@@ -294,11 +296,11 @@ void _nap_assert_num(double n1, double n2, nap_assert_num_optionals params, cons
         return;
 
     char buf1[64], buf2[64];
-    snprintf(buf1, sizeof(buf1), "%.6g", n1);
-    snprintf(buf2, sizeof(buf2), "%.6g", n2);
+    snprintf(buf1, sizeof(buf1), "%.6Lg", n1);
+    snprintf(buf2, sizeof(buf2), "%.6Lg", n2);
 
     char tol_buf[64];
-    snprintf(tol_buf, sizeof(tol_buf), "%.6g", tolerance);
+    snprintf(tol_buf, sizeof(tol_buf), "%.6Lg", tolerance);
 
     char expr[256];
     snprintf(expr, sizeof(expr), "%s ~= %s (tolerance: %s)", buf1, buf2, tol_buf);
